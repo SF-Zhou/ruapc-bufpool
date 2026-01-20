@@ -1,0 +1,26 @@
+[package]
+name = "ruapc-bufpool"
+version = "0.1.0"
+edition = "2024"
+authors = ["SF-Zhou"]
+description = "A high-performance memory pool using buddy memory allocation algorithm for efficient fixed-size buffer management"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SF-Zhou/ruapc-bufpool"
+keywords = ["memory-pool", "buddy-allocation", "buffer", "async", "tokio"]
+categories = ["memory-management", "asynchronous"]
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
