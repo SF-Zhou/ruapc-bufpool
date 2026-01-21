@@ -12,7 +12,7 @@ readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]
-tokio = { version = "1", features = ["sync", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "macros", "time", "rt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }

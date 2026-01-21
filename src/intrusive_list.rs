@@ -219,7 +219,7 @@ mod tests {
     fn test_push_pop_single() {
         let mut list: IntrusiveList<i32> = IntrusiveList::new();
         let mut node = IntrusiveNode::new(42);
-        let node_ptr = NonNull::new(&mut node).unwrap();
+        let node_ptr = NonNull::new(&raw mut node).unwrap();
 
         unsafe {
             list.push_front(node_ptr);
@@ -246,9 +246,9 @@ mod tests {
         ];
 
         unsafe {
-            list.push_front(NonNull::new(&mut nodes[0]).unwrap());
-            list.push_front(NonNull::new(&mut nodes[1]).unwrap());
-            list.push_front(NonNull::new(&mut nodes[2]).unwrap());
+            list.push_front(NonNull::new(&raw mut nodes[0]).unwrap());
+            list.push_front(NonNull::new(&raw mut nodes[1]).unwrap());
+            list.push_front(NonNull::new(&raw mut nodes[2]).unwrap());
         }
 
         assert_eq!(list.len(), 3);
@@ -272,9 +272,9 @@ mod tests {
             IntrusiveNode::new(3),
         ];
 
-        let ptr0 = NonNull::new(&mut nodes[0]).unwrap();
-        let ptr1 = NonNull::new(&mut nodes[1]).unwrap();
-        let ptr2 = NonNull::new(&mut nodes[2]).unwrap();
+        let ptr0 = NonNull::new(&raw mut nodes[0]).unwrap();
+        let ptr1 = NonNull::new(&raw mut nodes[1]).unwrap();
+        let ptr2 = NonNull::new(&raw mut nodes[2]).unwrap();
 
         unsafe {
             list.push_front(ptr0);
@@ -298,8 +298,8 @@ mod tests {
         let mut list: IntrusiveList<i32> = IntrusiveList::new();
         let mut nodes = [IntrusiveNode::new(1), IntrusiveNode::new(2)];
 
-        let ptr0 = NonNull::new(&mut nodes[0]).unwrap();
-        let ptr1 = NonNull::new(&mut nodes[1]).unwrap();
+        let ptr0 = NonNull::new(&raw mut nodes[0]).unwrap();
+        let ptr1 = NonNull::new(&raw mut nodes[1]).unwrap();
 
         unsafe {
             list.push_front(ptr0);
@@ -321,8 +321,8 @@ mod tests {
         let mut list: IntrusiveList<i32> = IntrusiveList::new();
         let mut nodes = [IntrusiveNode::new(1), IntrusiveNode::new(2)];
 
-        let ptr0 = NonNull::new(&mut nodes[0]).unwrap();
-        let ptr1 = NonNull::new(&mut nodes[1]).unwrap();
+        let ptr0 = NonNull::new(&raw mut nodes[0]).unwrap();
+        let ptr1 = NonNull::new(&raw mut nodes[1]).unwrap();
 
         unsafe {
             list.push_front(ptr0);

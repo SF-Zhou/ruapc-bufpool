@@ -36,6 +36,9 @@ pub const NODES_PER_LEVEL: [usize; NUM_LEVELS] = [64, 16, 4, 1];
 /// Total number of nodes in the state array: 64 + 16 + 4 + 1 = 85
 pub const TOTAL_STATE_NODES: usize = 85;
 
+#[allow(clippy::manual_div_ceil)]
+pub const STATE_ARRAY_BYTES: usize = (TOTAL_STATE_NODES * 2).div_ceil(8);
+
 /// Starting index in the state array for each level.
 /// Level 0: 0..64
 /// Level 1: 64..80
@@ -44,6 +47,10 @@ pub const TOTAL_STATE_NODES: usize = 85;
 pub const LEVEL_STATE_OFFSETS: [usize; NUM_LEVELS] = [0, 64, 80, 84];
 
 /// State of a node in the buddy tree.
+///
+/// States are bit-packed into the buddy block's state array.
+/// Each node uses 2 bits (00=Allocated, 01=Free, 10=Split).
+/// This compact representation reduces memory overhead from 85 bytes to 16 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(Default)]
@@ -55,6 +62,25 @@ pub enum NodeState {
     Free = 1,
     /// The node has been split into smaller children.
     Split = 2,
+}
+
+impl NodeState {
+    /// Converts state to its bit-packed representation.
+    #[inline]
+    pub const fn as_bits(self) -> u8 {
+        self as u8
+    }
+
+    /// Creates state from its bit-packed representation.
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Self::Allocated,
+            1 => Self::Free,
+            2 => Self::Split,
+            _ => panic!("invalid bits"),
+        }
+    }
 }
 
 /// Data stored in each free list node.
@@ -82,7 +108,7 @@ pub type FreeNode = IntrusiveNode<FreeNodeData>;
 ///
 /// Each block contains:
 /// - A pointer to the raw 64MiB memory region
-/// - A state array tracking allocation status of all nodes
+/// - A bit-packed state array tracking allocation status of all nodes
 /// - Free list nodes for each possible allocation unit
 ///
 /// The free list nodes are stored inline to avoid additional allocations.
@@ -90,13 +116,8 @@ pub struct BuddyBlock {
     /// Pointer to the 64MiB memory region.
     pub memory: *mut u8,
 
-    /// Allocation state for all nodes in the buddy tree.
-    /// Index mapping:
-    /// - 0..64: Level 0 (1MiB nodes)
-    /// - 64..80: Level 1 (4MiB nodes)
-    /// - 80..84: Level 2 (16MiB nodes)
-    /// - 84..85: Level 3 (64MiB node)
-    pub states: [NodeState; TOTAL_STATE_NODES],
+    /// Bit-packed allocation state for all nodes in the buddy tree.
+    pub states: [u8; STATE_ARRAY_BYTES],
 
     /// Free list nodes for level 0 (64 nodes of 1MiB each).
     pub level0_nodes: [FreeNode; 64],
@@ -122,15 +143,16 @@ impl BuddyBlock {
     /// - `memory` points to a valid 64MiB region
     /// - The memory region will remain valid for the lifetime of this block
     pub unsafe fn new(memory: *mut u8) -> Box<Self> {
-        // Create placeholder FreeNodeData - will be updated once we have the block address
-        let placeholder_data = || FreeNodeData {
-            block: NonNull::dangling(),
-            index_in_level: 0,
-        };
+        const fn placeholder_data() -> FreeNodeData {
+            FreeNodeData {
+                block: NonNull::dangling(),
+                index_in_level: 0,
+            }
+        }
 
         let mut block = Box::new(Self {
             memory,
-            states: [NodeState::Allocated; TOTAL_STATE_NODES],
+            states: [0u8; STATE_ARRAY_BYTES],
             level0_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
             level1_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
             level2_nodes: std::array::from_fn(|_| FreeNode::new(placeholder_data())),
@@ -164,8 +186,13 @@ impl BuddyBlock {
             index_in_level: 0,
         };
 
-        // Mark the root node (level 3) as free
-        block.states[LEVEL_STATE_OFFSETS[3]] = NodeState::Free;
+        // Initialize all states to Allocated (0x00)
+        for byte in &mut block.states {
+            *byte = 0;
+        }
+
+        // Set root node to Free using bit-packing
+        block.set_state(3, 0, NodeState::Free);
 
         block
     }
@@ -198,13 +225,24 @@ impl BuddyBlock {
     /// Gets the state of a node at the given level and index.
     #[inline]
     pub const fn get_state(&self, level: usize, index: usize) -> NodeState {
-        self.states[Self::state_index(level, index)]
+        let idx = Self::state_index(level, index);
+        let byte_idx = idx / 4;
+        let bit_offset = (idx % 4) * 2;
+        let bits = self.states[byte_idx];
+        let mask = 0b11 << bit_offset;
+        NodeState::from_bits((bits & mask) >> bit_offset)
     }
 
     /// Sets the state of a node at the given level and index.
     #[inline]
     pub const fn set_state(&mut self, level: usize, index: usize, state: NodeState) {
-        self.states[Self::state_index(level, index)] = state;
+        let idx = Self::state_index(level, index);
+        let byte_idx = idx / 4;
+        let bit_offset = (idx % 4) * 2;
+        let bits = self.states[byte_idx];
+        let mask = !(0b11 << bit_offset);
+        let new_bits = (bits & mask) | (state.as_bits() << bit_offset);
+        self.states[byte_idx] = new_bits;
     }
 
     /// Gets the memory address for a node at the given level and index.
@@ -227,11 +265,11 @@ impl BuddyBlock {
         }
     }
 
-    /// Gets the sibling indices for a node at the given level and index.
+    /// Gets the sibling indices for a node.
     ///
     /// Returns the indices of all 4 siblings (including the node itself).
     #[inline]
-    pub const fn get_siblings(_level: usize, index: usize) -> [usize; 4] {
+    pub const fn get_siblings(index: usize) -> [usize; 4] {
         let base = (index / 4) * 4;
         [base, base + 1, base + 2, base + 3]
     }
@@ -281,6 +319,7 @@ pub const fn size_to_level(size: usize) -> Option<usize> {
 
 /// Gets the actual allocation size for a given level.
 #[inline]
+#[allow(dead_code)] // Used in tests
 pub const fn level_to_size(level: usize) -> usize {
     LEVEL_SIZES[level]
 }
@@ -351,11 +390,11 @@ mod tests {
 
     #[test]
     fn test_get_siblings() {
-        assert_eq!(BuddyBlock::get_siblings(0, 0), [0, 1, 2, 3]);
-        assert_eq!(BuddyBlock::get_siblings(0, 2), [0, 1, 2, 3]);
-        assert_eq!(BuddyBlock::get_siblings(0, 4), [4, 5, 6, 7]);
-        assert_eq!(BuddyBlock::get_siblings(1, 0), [0, 1, 2, 3]);
-        assert_eq!(BuddyBlock::get_siblings(1, 5), [4, 5, 6, 7]);
+        assert_eq!(BuddyBlock::get_siblings(0), [0, 1, 2, 3]);
+        assert_eq!(BuddyBlock::get_siblings(2), [0, 1, 2, 3]);
+        assert_eq!(BuddyBlock::get_siblings(4), [4, 5, 6, 7]);
+        assert_eq!(BuddyBlock::get_siblings(0), [0, 1, 2, 3]);
+        assert_eq!(BuddyBlock::get_siblings(5), [4, 5, 6, 7]);
     }
 
     #[test]

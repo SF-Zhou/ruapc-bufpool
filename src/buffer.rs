@@ -3,34 +3,40 @@
 //! This module provides the [`Buffer`] type, which represents an allocated memory
 //! region from the buffer pool. When a `Buffer` is dropped, its memory is
 //! automatically returned to the pool for reuse.
+//!
+//! # Memory Layout
+//!
+//! The `Buffer` struct is optimized for minimal memory footprint:
+//! - `ptr`: 8 bytes (pointer to memory)
+//! - `pool`: 8 bytes (Arc reference to pool)
+//! - `block`: 8 bytes (pointer to buddy block)
+//! - `level`: 1 byte (0-3, only 4 possible values)
+//! - `index`: 1 byte (0-63, max index at level 0)
+//! - Padding: 6 bytes for alignment
+//!
+//! Total: 32 bytes per Buffer.
 
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-
+use crate::BufferPool;
 use crate::buddy::{BuddyBlock, FreeNode};
-
-/// Information needed to return a buffer to the pool.
-#[derive(Debug)]
-pub struct ReturnInfo {
-    /// The allocation level (0-3).
-    pub level: usize,
-    /// Index within the level in the buddy block.
-    pub index: usize,
-    /// Pointer to the buddy block this buffer belongs to.
-    pub block: NonNull<BuddyBlock>,
-}
-
-// SAFETY: ReturnInfo only contains raw pointers that are managed by the pool
-unsafe impl Send for ReturnInfo {}
-unsafe impl Sync for ReturnInfo {}
 
 /// A buffer allocated from the pool.
 ///
 /// This type provides read/write access to a contiguous memory region. When dropped,
 /// the buffer is automatically returned to the pool for reuse.
+///
+/// The buffer holds an `Arc<BufferPool>` reference to ensure the pool remains valid
+/// for the lifetime of the buffer. This guarantees memory safety even if the original
+/// pool handle is dropped.
+///
+/// # Memory Efficiency
+///
+/// Buffer fields are packed to minimize memory usage:
+/// - `level` uses `u8` (only values 0-3 are valid)
+/// - `index` uses `u8` (maximum 63 for level 0)
 ///
 /// # Example
 ///
@@ -56,20 +62,20 @@ pub struct Buffer {
     /// Pointer to the allocated memory.
     ptr: NonNull<u8>,
 
-    /// Size of the allocated memory.
-    len: usize,
-
-    /// The allocation level (0-3).
-    level: usize,
-
-    /// Index within the level in the buddy block.
-    index: usize,
+    /// Reference to the pool for returning the buffer.
+    /// This ensures the pool stays alive while any buffer exists.
+    pool: Arc<BufferPool>,
 
     /// Pointer to the buddy block this buffer belongs to.
     block: NonNull<BuddyBlock>,
 
-    /// Channel to return the buffer to the pool.
-    return_tx: Arc<mpsc::UnboundedSender<ReturnInfo>>,
+    /// The allocation level (0-3).
+    /// Packed as u8 to minimize struct size.
+    level: u8,
+
+    /// Index within the level in the buddy block.
+    /// Maximum value is 63 (for level 0), fits in u8.
+    index: u8,
 }
 
 // SAFETY: Buffer can be sent between threads as it only contains
@@ -83,42 +89,65 @@ unsafe impl Sync for Buffer {}
 impl Buffer {
     /// Creates a new buffer.
     ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Pointer to the allocated memory region
+    /// * `level` - Allocation level (0-3)
+    /// * `index` - Index within the level (0-63 for level 0)
+    /// * `block` - Pointer to the owning `BuddyBlock`
+    /// * `pool` - Arc reference to the pool for automatic return on drop
+    ///
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - `ptr` points to a valid memory region of at least `len` bytes
+    /// - `ptr` points to a valid memory region of the appropriate size for `level`
     /// - The memory will remain valid until the buffer is dropped
     /// - `block` points to a valid `BuddyBlock`
-    pub(crate) const unsafe fn new(
+    /// - `level` is in range 0-3
+    /// - `index` is valid for the given level
+    pub(crate) unsafe fn new(
         ptr: NonNull<u8>,
-        len: usize,
         level: usize,
         index: usize,
         block: NonNull<BuddyBlock>,
-        return_tx: Arc<mpsc::UnboundedSender<ReturnInfo>>,
+        pool: Arc<BufferPool>,
     ) -> Self {
+        debug_assert!(level < crate::buddy::NUM_LEVELS, "level must be 0-3");
+        debug_assert!(
+            index < crate::buddy::NODES_PER_LEVEL[0],
+            "index must be less than 64"
+        );
         Self {
             ptr,
-            len,
-            level,
-            index,
+            pool,
             block,
-            return_tx,
+            #[allow(clippy::cast_possible_truncation)]
+            level: level as u8, // Safe: level is validated to be < NUM_LEVELS
+            #[allow(clippy::cast_possible_truncation)]
+            index: index as u8, // Safe: index is validated to be < NODES_PER_LEVEL[0]
         }
     }
 
     /// Returns the length of the buffer in bytes.
+    ///
+    /// The length is derived from the allocation level:
+    /// - Level 0: 1 MiB
+    /// - Level 1: 4 MiB
+    /// - Level 2: 16 MiB
+    /// - Level 3: 64 MiB
     #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.len
+        crate::buddy::LEVEL_SIZES[self.level as usize]
     }
 
     /// Returns `true` if the buffer is empty.
+    ///
+    /// Note: Buffers from this pool are never empty (minimum 1 MiB).
     #[inline]
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        false // Minimum allocation is 1 MiB, never empty
     }
 
     /// Returns a raw pointer to the buffer's memory.
@@ -140,7 +169,7 @@ impl Buffer {
     #[must_use]
     pub const fn as_slice(&self) -> &[u8] {
         // SAFETY: ptr is valid for len bytes
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
     }
 
     /// Returns the buffer as a mutable byte slice.
@@ -148,21 +177,21 @@ impl Buffer {
     #[must_use]
     pub const fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr is valid for len bytes and we have exclusive access
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
     }
 
-    /// Returns the allocation level of this buffer.
+    /// Returns the allocation level of this buffer (0-3).
     #[inline]
     #[allow(dead_code)]
     pub(crate) const fn level(&self) -> usize {
-        self.level
+        self.level as usize
     }
 
-    /// Returns the index within the level.
+    /// Returns the index within the level (0-63).
     #[inline]
     #[allow(dead_code)]
     pub(crate) const fn index(&self) -> usize {
-        self.index
+        self.index as usize
     }
 
     /// Returns the buddy block pointer.
@@ -176,23 +205,24 @@ impl Buffer {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the block pointer is still valid.
+    /// The caller must ensure that block pointer is still valid.
     #[allow(dead_code)]
     pub(crate) unsafe fn free_node(&self) -> NonNull<FreeNode> {
         // SAFETY: block is valid and level/index are within bounds
-        unsafe { (*self.block.as_ptr()).get_free_node_mut(self.level, self.index) }
+        unsafe {
+            (*self.block.as_ptr()).get_free_node_mut(self.level as usize, self.index as usize)
+        }
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // Return the buffer to the pool via the channel
-        // This is non-blocking and works in any context
-        let _ = self.return_tx.send(ReturnInfo {
-            level: self.level,
-            index: self.index,
-            block: self.block,
-        });
+        // Return the buffer directly to the pool with O(1) operation.
+        // This acquires the pool's mutex lock to perform the deallocation.
+        // Since buddy merging is O(1), this is efficient and avoids the
+        // latency spikes that could occur with a batched channel approach.
+        self.pool
+            .return_buffer(self.level as usize, self.index as usize, self.block);
     }
 }
 
@@ -230,7 +260,7 @@ impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
             .field("ptr", &self.ptr)
-            .field("len", &self.len)
+            .field("len", &self.len())
             .field("level", &self.level)
             .field("index", &self.index)
             .finish_non_exhaustive()

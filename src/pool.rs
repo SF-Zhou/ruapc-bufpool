@@ -6,13 +6,13 @@
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::allocator::{Allocator, DefaultAllocator};
-use crate::buddy::{BuddyBlock, NUM_LEVELS, NodeState, SIZE_64MIB, level_to_size, size_to_level};
-use crate::buffer::{Buffer, ReturnInfo};
+use crate::buddy::{BuddyBlock, NUM_LEVELS, NodeState, SIZE_64MIB, size_to_level};
+use crate::buffer::Buffer;
 use crate::intrusive_list::IntrusiveList;
 
 /// Default maximum memory limit (256 MiB).
@@ -78,11 +78,11 @@ impl BufferPoolBuilder {
     }
 
     /// Builds the buffer pool with the configured settings.
+    ///
+    /// Returns an `Arc<BufferPool>` to enable efficient sharing across threads
+    /// and ensure buffers can maintain references to their owning pool.
     #[must_use]
-    pub fn build(self) -> BufferPool {
-        let (return_tx, return_rx) = mpsc::unbounded_channel();
-        let return_tx = Arc::new(return_tx);
-
+    pub fn build(self) -> Arc<BufferPool> {
         let inner = PoolInner {
             allocator: self.allocator,
             max_memory: self.max_memory,
@@ -91,13 +91,11 @@ impl BufferPoolBuilder {
             free_lists: std::array::from_fn(|_| IntrusiveList::new()),
             waiting_lists: std::array::from_fn(|_| VecDeque::new()),
             min_waiting_level: None,
-            return_tx: Arc::clone(&return_tx),
         };
 
-        BufferPool {
-            inner: Arc::new(Mutex::new(inner)),
-            return_rx: Arc::new(Mutex::new(return_rx)),
-        }
+        Arc::new(BufferPool {
+            inner: Mutex::new(inner),
+        })
     }
 }
 
@@ -110,6 +108,12 @@ impl BufferPoolBuilder {
 ///
 /// The pool uses `tokio::sync::Mutex` for thread safety, making it suitable for
 /// use in both synchronous and asynchronous contexts.
+///
+/// # Buffer Lifetime
+///
+/// Each allocated [`Buffer`] holds an `Arc<BufferPool>` reference, ensuring the
+/// pool remains valid for the lifetime of all buffers. When a buffer is dropped,
+/// its memory is immediately returned to the pool with O(1) complexity.
 ///
 /// # Example
 ///
@@ -130,10 +134,8 @@ impl BufferPoolBuilder {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct BufferPool {
-    inner: Arc<Mutex<PoolInner>>,
-    return_rx: Arc<Mutex<mpsc::UnboundedReceiver<ReturnInfo>>>,
+    inner: Mutex<PoolInner>,
 }
 
 impl BufferPool {
@@ -141,27 +143,29 @@ impl BufferPool {
     ///
     /// This is equivalent to `BufferPoolBuilder::new().build()`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new() -> Arc<Self> {
         BufferPoolBuilder::new().build()
     }
 
-    /// Processes any pending buffer returns.
+    /// Returns a buffer to the pool.
     ///
-    /// This should be called before allocation attempts to ensure
-    /// freed buffers are available.
-    fn process_returns_sync(&self, inner: &mut PoolInner) {
-        let mut rx = self.return_rx.blocking_lock();
-        while let Ok(info) = rx.try_recv() {
-            inner.deallocate_buffer(info.level, info.index, info.block);
-        }
-    }
-
-    /// Processes any pending buffer returns asynchronously.
-    async fn process_returns_async(&self, inner: &mut PoolInner) {
-        let mut rx = self.return_rx.lock().await;
-        while let Ok(info) = rx.try_recv() {
-            inner.deallocate_buffer(info.level, info.index, info.block);
-        }
+    /// This is called automatically when a [`Buffer`] is dropped. The operation
+    /// is O(1) for deallocation and O(log n) for buddy merging (where n is the
+    /// number of levels, which is constant at 4).
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - The allocation level (0-3)
+    /// * `index` - The index within the level
+    /// * `block` - Pointer to the buddy block
+    pub(crate) fn return_buffer(
+        self: &Arc<Self>,
+        level: usize,
+        index: usize,
+        block: NonNull<BuddyBlock>,
+    ) {
+        let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
+        inner.deallocate_buffer(level, index, block);
     }
 
     /// Allocates a buffer of at least the specified size.
@@ -190,6 +194,11 @@ impl BufferPool {
     /// - Memory limit has been reached (`OutOfMemory`)
     /// - Underlying allocator fails (`OutOfMemory`)
     ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (which only happens if another
+    /// thread panicked while holding the lock).
+    ///
     /// # Example
     ///
     /// ```rust
@@ -202,10 +211,9 @@ impl BufferPool {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn allocate(&self, size: usize) -> Result<Buffer> {
-        let mut inner = self.inner.blocking_lock();
-        self.process_returns_sync(&mut inner);
-        inner.allocate_sync(size)
+    pub fn allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
+        let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
+        inner.allocate_sync(size, Arc::clone(self))
     }
 
     /// Allocates a buffer asynchronously.
@@ -233,6 +241,11 @@ impl BufferPool {
     /// Note: Unlike [`allocate`](Self::allocate), this method will wait instead
     /// of returning `OutOfMemory` when the pool's memory limit is reached.
     ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (which only happens if another
+    /// thread panicked while holding the lock).
+    ///
     /// # Example
     ///
     /// ```rust
@@ -244,7 +257,7 @@ impl BufferPool {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn async_allocate(&self, size: usize) -> Result<Buffer> {
+    pub async fn async_allocate(self: &Arc<Self>, size: usize) -> Result<Buffer> {
         let level = size_to_level(size).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -254,37 +267,27 @@ impl BufferPool {
 
         loop {
             let receiver = {
-                let mut inner = self.inner.lock().await;
-                self.process_returns_async(&mut inner).await;
+                let mut inner = self.inner.lock().expect("BufferPool mutex poisoned");
 
                 // Try to allocate directly
-                match inner.try_allocate(level) {
+                match inner.try_allocate(level, Arc::clone(self)) {
                     Ok(buffer) => return Ok(buffer),
                     Err(e) if e.kind() == ErrorKind::OutOfMemory => {
                         // Memory limit reached, wait for a buffer
                         let (sender, receiver) = oneshot::channel();
                         inner.waiting_lists[level].push_back(sender);
-                        inner.update_min_waiting_level();
+                        inner.update_min_waiting_level_on_add(level);
                         receiver
                     }
                     Err(e) => return Err(e),
                 }
             };
 
-            // Wait for a buffer to be available or check for returned buffers
-            tokio::select! {
-                result = receiver => {
-                    match result {
-                        Ok(buffer) => return Ok(buffer),
-                        Err(_) => {
-                            // Sender was dropped, try again
-                        }
-                    }
-                }
-                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-                    // Check for returned buffers and retry
-                }
+            // Wait for buffer to be available (lock is released)
+            if let Ok(buffer) = receiver.await {
+                return Ok(buffer);
             }
+            // Sender was dropped without sending, retry allocation
         }
     }
 
@@ -292,27 +295,39 @@ impl BufferPool {
     ///
     /// This includes all 64 MiB blocks that have been allocated from the
     /// underlying allocator, regardless of how much is currently in use.
-    pub async fn allocated_memory(&self) -> usize {
-        self.inner.lock().await.allocated_memory
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn allocated_memory(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("BufferPool mutex poisoned")
+            .allocated_memory
     }
 
     /// Returns the maximum memory limit in bytes.
-    pub async fn max_memory(&self) -> usize {
-        self.inner.lock().await.max_memory
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn max_memory(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("BufferPool mutex poisoned")
+            .max_memory
     }
 
     /// Returns the number of free buffers at each level.
     ///
     /// The returned array contains counts for levels 0-3 (1 MiB to 64 MiB).
-    pub async fn free_counts(&self) -> [usize; NUM_LEVELS] {
-        let inner = self.inner.lock().await;
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn free_counts(&self) -> [usize; NUM_LEVELS] {
+        let inner = self.inner.lock().expect("BufferPool mutex poisoned");
         std::array::from_fn(|i| inner.free_lists[i].len())
-    }
-}
-
-impl Default for BufferPool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -320,7 +335,7 @@ impl Default for BufferPool {
 type WaitingSender = oneshot::Sender<Buffer>;
 
 /// Internal pool state protected by the mutex.
-pub struct PoolInner {
+struct PoolInner {
     /// The allocator used for allocating 64 MiB blocks.
     allocator: Box<dyn Allocator>,
 
@@ -344,14 +359,11 @@ pub struct PoolInner {
 
     /// Minimum level that has waiting allocations.
     min_waiting_level: Option<usize>,
-
-    /// Channel sender for buffer returns.
-    return_tx: Arc<mpsc::UnboundedSender<ReturnInfo>>,
 }
 
 impl PoolInner {
     /// Synchronous allocation - returns error if memory limit reached.
-    fn allocate_sync(&mut self, size: usize) -> Result<Buffer> {
+    fn allocate_sync(&mut self, size: usize, pool: Arc<BufferPool>) -> Result<Buffer> {
         let level = size_to_level(size).ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -359,15 +371,15 @@ impl PoolInner {
             )
         })?;
 
-        self.try_allocate(level)
+        self.try_allocate(level, pool)
     }
 
     /// Tries to allocate a buffer at the given level.
     ///
     /// Returns `OutOfMemory` error if the memory limit is reached.
-    fn try_allocate(&mut self, level: usize) -> Result<Buffer> {
+    fn try_allocate(&mut self, level: usize, pool: Arc<BufferPool>) -> Result<Buffer> {
         // Try to find a free buffer at this level or split from a larger one
-        if let Some(buffer) = self.try_allocate_from_free_lists(level) {
+        if let Some(buffer) = self.try_allocate_from_free_lists(level, Arc::clone(&pool)) {
             return Ok(buffer);
         }
 
@@ -375,24 +387,33 @@ impl PoolInner {
         self.allocate_new_block()?;
 
         // Try again - should succeed now
-        self.try_allocate_from_free_lists(level)
+        self.try_allocate_from_free_lists(level, pool)
             .ok_or_else(|| Error::other("allocation failed unexpectedly"))
     }
 
     /// Tries to allocate from existing free lists.
-    fn try_allocate_from_free_lists(&mut self, level: usize) -> Option<Buffer> {
+    fn try_allocate_from_free_lists(
+        &mut self,
+        level: usize,
+        pool: Arc<BufferPool>,
+    ) -> Option<Buffer> {
         // Look for a free buffer at this level or higher
         for search_level in level..NUM_LEVELS {
             if !self.free_lists[search_level].is_empty() {
                 // Found a free buffer, potentially need to split
-                return Some(self.allocate_at_level(search_level, level));
+                return Some(self.allocate_at_level(search_level, level, pool));
             }
         }
         None
     }
 
     /// Allocates a buffer by taking from `from_level` and splitting down to `target_level`.
-    fn allocate_at_level(&mut self, from_level: usize, target_level: usize) -> Buffer {
+    fn allocate_at_level(
+        &mut self,
+        from_level: usize,
+        target_level: usize,
+        pool: Arc<BufferPool>,
+    ) -> Buffer {
         // Pop a free node from the source level
         let node = self.free_lists[from_level].pop_front().unwrap();
 
@@ -410,22 +431,20 @@ impl PoolInner {
             block_ref.set_state(from_level, index_in_level, NodeState::Allocated);
 
             let ptr = block_ref.get_memory_addr(from_level, index_in_level);
-            let len = level_to_size(from_level);
 
-            // SAFETY: ptr is valid, len is correct, block is valid
+            // SAFETY: ptr is valid, block is valid, level/index are correct
             unsafe {
                 Buffer::new(
                     NonNull::new(ptr).unwrap(),
-                    len,
                     from_level,
                     index_in_level,
                     block,
-                    Arc::clone(&self.return_tx),
+                    pool,
                 )
             }
         } else {
             // Need to split
-            self.split_and_allocate(block, from_level, index_in_level, target_level)
+            self.split_and_allocate(block, from_level, index_in_level, target_level, pool)
         }
     }
 
@@ -436,6 +455,7 @@ impl PoolInner {
         from_level: usize,
         from_index: usize,
         target_level: usize,
+        pool: Arc<BufferPool>,
     ) -> Buffer {
         // SAFETY: block pointer is valid
         let block_ref = unsafe { &mut *block.as_ptr() };
@@ -472,17 +492,15 @@ impl PoolInner {
         block_ref.set_state(current_level, current_index, NodeState::Allocated);
 
         let ptr = block_ref.get_memory_addr(current_level, current_index);
-        let len = level_to_size(current_level);
 
-        // SAFETY: ptr is valid, len is correct, block is valid
+        // SAFETY: ptr is valid, block is valid, level/index are correct
         unsafe {
             Buffer::new(
                 NonNull::new(ptr).unwrap(),
-                len,
                 current_level,
                 current_index,
                 block,
-                Arc::clone(&self.return_tx),
+                pool,
             )
         }
     }
@@ -523,6 +541,10 @@ impl PoolInner {
     }
 
     /// Deallocates a buffer and returns it to the appropriate free list.
+    ///
+    /// This method performs O(1) deallocation and O(log n) buddy merging where
+    /// n is the number of levels (constant at 4). If there are waiters for
+    /// memory, they will be notified to retry allocation.
     pub(crate) fn deallocate_buffer(
         &mut self,
         level: usize,
@@ -535,19 +557,17 @@ impl PoolInner {
         // Try to merge with siblings
         let (final_level, _final_index) = self.try_merge(block_ref, level, index);
 
-        // Check if we should satisfy a waiting allocation
+        // Check if we should notify a waiting allocation
         if let Some(min_waiting) = self.min_waiting_level {
             // Check if we can satisfy any waiting allocation
             // We can satisfy if the freed buffer is >= the waiting level
             if final_level >= min_waiting {
                 // Find the smallest waiting level we can satisfy
                 for wait_level in min_waiting..=final_level {
-                    if let Some(sender) = self.waiting_lists[wait_level].pop_front() {
-                        // Allocate from the free buffer and send to waiter
-                        if let Some(buffer) = self.try_allocate_from_free_lists(wait_level) {
-                            let _ = sender.send(buffer);
-                        }
-                        self.update_min_waiting_level();
+                    if self.waiting_lists[wait_level].pop_front().is_some() {
+                        // Sender is dropped here, signaling the waiter to retry.
+                        // The waiter will re-acquire the lock and allocate.
+                        self.update_min_waiting_level_on_remove(wait_level);
                         return;
                     }
                 }
@@ -576,7 +596,7 @@ impl PoolInner {
             }
 
             // Get sibling indices
-            let siblings = BuddyBlock::get_siblings(current_level, current_index);
+            let siblings = BuddyBlock::get_siblings(current_index);
 
             // Check if all siblings are free
             let all_free = siblings.iter().all(|&idx| {
@@ -616,10 +636,27 @@ impl PoolInner {
         }
     }
 
-    /// Updates the minimum waiting level after a change to waiting lists.
-    fn update_min_waiting_level(&mut self) {
-        self.min_waiting_level =
-            (0..NUM_LEVELS).find(|&level| !self.waiting_lists[level].is_empty());
+    /// Updates the minimum waiting level after adding a waiter.
+    #[allow(clippy::missing_const_for_fn)]
+    fn update_min_waiting_level_on_add(&mut self, added_level: usize) {
+        match self.min_waiting_level {
+            None => self.min_waiting_level = Some(added_level),
+            Some(min_level) if added_level < min_level => {
+                self.min_waiting_level = Some(added_level);
+            }
+            _ => {}
+        }
+    }
+
+    /// Updates the minimum waiting level after removing a waiter.
+    fn update_min_waiting_level_on_remove(&mut self, removed_level: usize) {
+        if self.min_waiting_level == Some(removed_level)
+            && self.waiting_lists[removed_level].is_empty()
+        {
+            // Find the next non-empty waiting list
+            self.min_waiting_level =
+                (removed_level..NUM_LEVELS).find(|&level| !self.waiting_lists[level].is_empty());
+        }
     }
 }
 
@@ -813,11 +850,11 @@ mod tests {
     async fn test_pool_stats() {
         let pool = BufferPoolBuilder::new().max_memory(SIZE_64MIB * 2).build();
 
-        assert_eq!(pool.allocated_memory().await, 0);
-        assert_eq!(pool.max_memory().await, SIZE_64MIB * 2);
+        assert_eq!(pool.allocated_memory(), 0);
+        assert_eq!(pool.max_memory(), SIZE_64MIB * 2);
 
         let _buffer = pool.async_allocate(SIZE_1MIB).await.unwrap();
-        assert_eq!(pool.allocated_memory().await, SIZE_64MIB);
+        assert_eq!(pool.allocated_memory(), SIZE_64MIB);
     }
 
     #[test]

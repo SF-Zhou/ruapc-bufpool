@@ -78,14 +78,27 @@ pub trait Allocator: Send + Sync {
 /// Default allocator using the standard library's global allocator.
 ///
 /// This allocator uses `std::alloc::alloc` and `std::alloc::dealloc` for memory
-/// management. It aligns allocations to the page size (4096 bytes) for optimal
-/// performance with large buffers.
+/// management. It aligns allocations to page size for optimal performance with large buffers.
+///
+/// # Alignment
+///
+/// - On 64-bit systems: Uses 2MiB alignment for potential huge page support
+/// - On other systems: Uses 4KiB page alignment
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultAllocator;
 
 impl DefaultAllocator {
-    /// Page size alignment for allocations (4KiB).
-    const ALIGNMENT: usize = 4096;
+    /// Returns the alignment size for this platform.
+    #[cfg(target_pointer_width = "64")]
+    const fn alignment() -> usize {
+        2 * 1024 * 1024 // 2MiB
+    }
+
+    /// Returns the alignment size for this platform.
+    #[cfg(not(target_pointer_width = "64"))]
+    const fn alignment() -> usize {
+        4096 // 4KiB
+    }
 
     /// Creates a new default allocator.
     #[must_use]
@@ -101,7 +114,7 @@ impl Allocator for DefaultAllocator {
         }
 
         // SAFETY: size is non-zero and alignment is a power of 2
-        let layout = Layout::from_size_align(size, Self::ALIGNMENT)
+        let layout = Layout::from_size_align(size, Self::alignment())
             .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
 
         // SAFETY: layout is valid (non-zero size, valid alignment)
@@ -123,7 +136,7 @@ impl Allocator for DefaultAllocator {
         }
 
         // SAFETY: size is non-zero and alignment is a power of 2
-        if let Ok(layout) = Layout::from_size_align(size, Self::ALIGNMENT) {
+        if let Ok(layout) = Layout::from_size_align(size, Self::alignment()) {
             // SAFETY: ptr was allocated with this layout by allocate()
             unsafe { dealloc(ptr, layout) };
         }

@@ -11,11 +11,12 @@ A high-performance memory pool using the buddy memory allocation algorithm for e
 
 - **Buddy Memory Allocation**: Efficiently manages memory in 64 MiB blocks, supporting allocation of 1 MiB, 4 MiB, 16 MiB, and 64 MiB buffers
 - **Both Sync and Async APIs**: Designed for tokio environments with async-first design using `tokio::sync::Mutex`
-- **Automatic Memory Reclamation**: Buffers are automatically returned to the pool when dropped
+- **Automatic Memory Reclamation**: Buffers are automatically returned to the pool when dropped with O(1) deallocation
 - **Memory Limits**: Configurable maximum memory usage with async waiting when limits are reached
 - **Custom Allocators**: Pluggable allocator trait for custom memory allocation backends
 - **O(1) Buddy Merging**: Intrusive doubly-linked list with O(1) free/merge operations
 - **Zero Copy**: Direct memory access through `Buffer` type that implements `Deref<Target = [u8]>`
+- **Memory Efficient**: Buffer struct optimized to 32 bytes using packed fields
 
 ## Installation
 
@@ -31,10 +32,11 @@ ruapc-bufpool = "0.1"
 ### Synchronous Allocation
 
 ```rust
-use ruapc_bufpool::{BufferPool, BufferPoolBuilder};
+use ruapc_bufpool::BufferPoolBuilder;
 
 fn main() -> std::io::Result<()> {
     // Create a buffer pool with 256 MiB max memory (default)
+    // Returns Arc<BufferPool> for safe sharing across threads
     let pool = BufferPoolBuilder::new()
         .max_memory(256 * 1024 * 1024)
         .build();
@@ -131,22 +133,33 @@ When freeing:
 
 ### Memory Management
 
-- Each 64 MiB block maintains a state array tracking allocation status
+- Each 64 MiB block maintains a bit-packed state array (22 bytes for 85 nodes)
 - Free lists use intrusive doubly-linked lists for O(1) operations
-- Buffer return uses unbounded channels to avoid blocking in drop
+- Buffer holds `Arc<BufferPool>` reference, ensuring pool validity
+- Buffer drop directly acquires lock and deallocates with O(1) operation
 
 ### Thread Safety
 
 - Uses `tokio::sync::Mutex` for synchronization
 - Sync allocation uses `blocking_lock()`
 - Async allocation uses `lock().await`
-- Buffer drop sends through unbounded channel (non-blocking)
+- Buffer drop handles both sync and async contexts intelligently
+
+### Buffer Memory Layout
+
+The `Buffer` struct is optimized for minimal memory footprint (32 bytes):
+- `ptr`: 8 bytes (pointer to memory)
+- `pool`: 8 bytes (Arc reference to pool)
+- `block`: 8 bytes (pointer to buddy block)
+- `level`: 1 byte (0-3, only 4 possible values)
+- `index`: 1 byte (0-63, max index at level 0)
+- Padding: 6 bytes for alignment
 
 ## Performance Considerations
 
 - **Allocation**: O(log n) where n is the number of levels (constant in practice)
 - **Deallocation**: O(log n) for merging, O(1) for just freeing
-- **Memory overhead**: ~85 bytes state array per 64 MiB block
+- **Memory overhead**: ~22 bytes state array + free list nodes per 64 MiB block
 - **Best for**: Large buffers (1+ MiB), frequent allocation/deallocation patterns
 
 ## API Reference
